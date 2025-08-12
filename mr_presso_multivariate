@@ -1,0 +1,326 @@
+#' Multivariate MR-PRESSO (Mendelian Randomization Pleiotropy RESidual Sum and Outlier)
+#' 
+#' @description
+#' Extension of univariate MR-PRESSO to handle multiple outcomes simultaneously.
+#' Performs outlier detection and correction in multivariate Mendelian Randomization analyses.
+#' 
+#' @param BetaOutcome Character vector of column names for outcome betas
+#' @param BetaExposure Character vector of column names for exposure betas
+#' @param SdOutcome Character vector of column names for outcome standard deviations
+#' @param SdExposure Character vector of column names for exposure standard deviations
+#' @param data Data frame containing the MR summary statistics
+#' @param OUTLIERtest Logical, whether to perform outlier test
+#' @param DISTORTIONtest Logical, whether to perform distortion test
+#' @param SignifThreshold Numeric, significance threshold for outlier detection
+#' @param NbDistribution Integer, number of simulations for empirical p-value calculation
+#' @param seed Integer, random seed for reproducibility
+#' 
+#' @return A list containing:
+#'   - Main MR results: Data frame with raw and outlier-corrected causal estimates
+#'   - MR-PRESSO results: List containing Global Test, Outlier Test, and Distortion Test results
+#' 
+#' @details
+#' This function extends the univariate MR-PRESSO method to handle multiple outcomes
+#' by using Mahalanobis distances for multivariate outlier detection. It performs:
+#' 1. Standard MR-IVW analysis
+#' 2. Individual SNP outlier detection
+#' 3. Distortion test to assess bias from outliers
+#' 4. Outlier-corrected MR analysis
+#' 
+#' @examples
+#' \dontrun{
+#' # Example usage with multiple outcomes
+#' results <- mr_presso_multivariate(
+#'   BetaOutcome = c("beta.outcome1", "beta.outcome2"),
+#'   BetaExposure = c("beta.exposure1", "beta.exposure2"),
+#'   SdOutcome = c("se.outcome1", "se.outcome2"),
+#'   SdExposure = c("se.exposure1", "se.exposure2"),
+#'   data = mr_data,
+#'   OUTLIERtest = TRUE,
+#'   DISTORTIONtest = TRUE
+#' )
+#' }
+
+mr_presso_multivariate <- function(BetaOutcome, BetaExposure, SdOutcome, SdExposure, data,
+                                   OUTLIERtest = FALSE, DISTORTIONtest = FALSE, 
+                                   SignifThreshold = 0.05, NbDistribution = 1000, seed = NULL){
+  
+  # Set seed for reproducibility if provided
+  if(!is.null(seed)) set.seed(seed)
+  
+  # Input validation
+  if(SignifThreshold > 1) stop("The significance threshold cannot be greater than 1")
+  
+  if(length(BetaExposure) != length(SdExposure))
+    stop("BetaExposure and SdExposure must have the same number of elements")
+  
+  if(class(data)[1] != "data.frame")
+    stop("data must be an object of class data.frame, try to rerun MR-PRESSO by converting data to a data.frame \'data = as.data.frame(data)\'")
+  
+  # Helper functions
+  "%^%" <- function(x, n) with(eigen(x), vectors %*% (values^n * t(vectors)))
+  
+  #' Calculate RSS using Leave-One-Out approach
+  getRSS_LOO <- function(BetaOutcome, BetaExposure, data, returnIV){
+    # Create a matrix of weights, one column per outcome
+    WeightMatrix <- as.matrix(data[, paste0("Weights_", seq_along(BetaOutcome))])
+    
+    n_outcomes <- length(BetaOutcome)
+    n_exposures <- length(BetaExposure)
+    n_samples <- nrow(data)
+    
+    CausalEstimate_LOO <- array(0, dim = c(n_exposures, n_outcomes, n_samples))
+    
+    for (i in 1:n_samples) {
+      for (j in 1:n_outcomes) {
+        X <- as.matrix(data[-i, BetaExposure]) * sqrt(WeightMatrix[-i, j])
+        Y <- as.matrix(data[-i, BetaOutcome[j]]) * sqrt(WeightMatrix[-i, j])
+        CausalEstimate_LOO[,j,i] <- solve(t(X) %*% X) %*% t(X) %*% Y
+      }
+    }
+    
+    residuals <- matrix(0, nrow = n_samples, ncol = n_outcomes)
+    for (i in 1:n_samples) {
+      for (j in 1:n_outcomes) {
+        X_i <- as.matrix(data[i, BetaExposure, drop = FALSE]) * sqrt(WeightMatrix[i, j])
+        Y_i <- as.matrix(data[i, BetaOutcome[j], drop = FALSE]) * sqrt(WeightMatrix[i, j])
+        residuals[i, j] <- Y_i - as.vector(X_i %*% CausalEstimate_LOO[,j,i])
+      }
+    }
+    
+    cov_matrix <- cov(residuals)
+    
+    mahalanobis_distances <- sapply(1:n_samples, function(i) {
+      mahalanobis(residuals[i,], center = colMeans(residuals), cov = cov_matrix)
+    })
+    
+    RSS <- sum(mahalanobis_distances)
+    
+    if(returnIV)
+      RSS <- list(RSS, CausalEstimate_LOO)
+    return(RSS)
+  }
+  
+  #' Generate random data for empirical p-value calculation
+  getRandomData <- function(BetaOutcome, BetaExposure, SdOutcome, SdExposure, data){
+    WeightMatrix <- as.matrix(data[, paste0("Weights_", seq_along(BetaOutcome))])
+    
+    mod_IVW <- lapply(1:nrow(data), function(i) {
+      lapply(1:length(BetaOutcome), function(j) {
+        lm(as.formula(paste0(BetaOutcome[j], " ~ -1 + ", paste(BetaExposure, collapse=" + "))), 
+           weights = WeightMatrix[-i, j], data = data[-i, ])
+      })
+    })
+    
+    random_exposures <- do.call(cbind, lapply(1:length(BetaExposure), function(j) {
+      rnorm(nrow(data), data[, BetaExposure[j]], data[, SdExposure[j]])
+    }))
+    
+    random_outcomes <- do.call(rbind, lapply(1:nrow(data), function(i) {
+      mu <- sapply(1:length(BetaOutcome), function(j) {
+        predict(mod_IVW[[i]][[j]], newdata = data[i, , drop = FALSE])
+      })
+      sd_values <- as.numeric(data[i, SdOutcome])
+      
+      mu <- as.vector(mu)
+      Sigma <- diag(sd_values^2)
+      
+      if (length(mu) != nrow(Sigma)) {
+        stop(paste("Dimension mismatch at row", i, ": length(mu) =", length(mu), "but nrow(Sigma) =", nrow(Sigma)))
+      }
+      
+      mvrnorm(n = 1, mu = mu, Sigma = Sigma)
+    }))
+    
+    random_outcomes <- matrix(random_outcomes, nrow = nrow(data))
+    
+    dataRandom <- cbind(random_exposures, random_outcomes, WeightMatrix)
+    colnames(dataRandom) <- c(BetaExposure, BetaOutcome, paste0("Weights_", seq_along(BetaOutcome)))
+    
+    return(dataRandom)
+  }
+  
+  # 0. Data preprocessing and validation
+  data <- data[, c(BetaOutcome, BetaExposure, SdOutcome, SdExposure)]
+  data <- data[rowSums(is.na(data)) == 0, ]
+  data[, c(BetaOutcome, BetaExposure)] <- data[, c(BetaOutcome, BetaExposure)] * sign(data[, BetaExposure[1]])
+  
+  # Calculate outcome-specific weights
+  for (i in seq_along(BetaOutcome)) {
+    data[, paste0("Weights_", i)] <- 1 / data[, SdOutcome[i]]^2
+  }
+  
+  if(nrow(data) <= length(BetaExposure) + 2)
+    stop("Not enough instrumental variables")
+  
+  if(nrow(data) >= NbDistribution)
+    stop("Not enough elements to compute empirical P-values, increase NbDistribution")
+  
+  # 1. Compute observed residual sum of squares (RSS)
+  RSSobs <- getRSS_LOO(BetaOutcome = BetaOutcome, BetaExposure = BetaExposure, 
+                       data = data, returnIV = OUTLIERtest)
+  
+  # 2. Compute distribution of expected RSS
+  randomData <- replicate(NbDistribution, 
+                         getRandomData(BetaOutcome = BetaOutcome, BetaExposure = BetaExposure, 
+                                      SdOutcome = SdOutcome, SdExposure = SdExposure, data = data), 
+                         simplify = FALSE)
+  RSSexp <- sapply(randomData, getRSS_LOO, BetaOutcome = BetaOutcome, 
+                   BetaExposure = BetaExposure, returnIV = OUTLIERtest)
+  
+  # 3. Perform single IV outlier test
+  OutlierTest <- do.call("rbind", lapply(1:nrow(data), function(SNV){
+    randomSNP <- do.call("rbind", lapply(randomData, function(mat) mat[SNV, ]))
+    Dif <- data[SNV, BetaOutcome] - as.vector(data[SNV, BetaExposure] %*% RSSobs[[2]][,,SNV])
+    Exp <- t(apply(randomSNP[, BetaOutcome, drop = FALSE], 1, 
+                   function(y) y - randomSNP[SNV, BetaExposure] %*% RSSobs[[2]][,,SNV]))
+    mahalanobis_dist <- mahalanobis(Dif, center = colMeans(Exp), cov = cov(Exp))
+    pval <- sum(mahalanobis(Exp, center = colMeans(Exp), cov = cov(Exp)) > mahalanobis_dist)/length(randomData)
+    pval <- cbind.data.frame(RSSobs = mahalanobis_dist, Pvalue = pval)
+    return(pval)
+  }))
+  row.names(OutlierTest) <- row.names(data)
+  OutlierTest$Pvalue <- p.adjust(OutlierTest$Pvalue, method = "bonferroni")
+  outliers <- which(OutlierTest$Pvalue <= SignifThreshold)
+  
+  
+  cat("Number of outliers detected:", length(outliers), "\n")
+  cat("Outlier indices:", outliers, "\n")
+  
+  # 4. Test for distortion of causal estimate
+  Y <- as.matrix(data[, BetaOutcome])
+  X <- as.matrix(data[, BetaExposure])
+  mod_all <- lapply(1:length(BetaOutcome), function(i) {
+    lm(Y[,i] ~ X - 1, weights = data[, paste0("Weights_", i)])
+  })
+  
+  if(DISTORTIONtest & length(outliers) > 0){
+    getRandomBias <- function(BetaOutcome, BetaExposure, SdOutcome, SdExposure, data, refOutlier){
+      indices <- c(refOutlier, replicate(nrow(data)-length(refOutlier), 
+                                        sample(setdiff(1:nrow(data), refOutlier))[1]))
+      mod_random <- lapply(1:length(BetaOutcome), function(i) {
+        lm(as.matrix(data[indices[1:(length(indices) - length(refOutlier))], BetaOutcome[i]]) ~ 
+             as.matrix(data[indices[1:(length(indices) - length(refOutlier))], BetaExposure]) - 1, 
+           weights = data[indices[1:(length(indices) - length(refOutlier))], paste0("Weights_", i)])
+      })
+      return(lapply(mod_random, coef))
+    }
+    
+    if(length(outliers) < nrow(data)){
+      BiasExp <- replicate(NbDistribution, 
+                          getRandomBias(BetaOutcome = BetaOutcome, BetaExposure = BetaExposure, 
+                                       data = data, refOutlier = outliers), 
+                          simplify = FALSE)
+      
+      mod_noOutliers <- lapply(1:length(BetaOutcome), function(i) {
+        lm(as.matrix(data[-outliers, BetaOutcome[i]]) ~ 
+             as.matrix(data[-outliers, BetaExposure]) - 1, 
+           weights = data[-outliers, paste0("Weights_", i)])
+      })
+      
+      coef_all <- lapply(mod_all, coef)
+      coef_noOutliers <- lapply(mod_noOutliers, coef)
+      
+      BiasObs <- lapply(seq_along(BetaOutcome), function(i) {
+        (coef_all[[i]] - coef_noOutliers[[i]]) / abs(coef_noOutliers[[i]])
+      })
+      
+      BiasExp <- lapply(seq_along(BetaOutcome), function(i) {
+        sapply(BiasExp, function(x) (coef_all[[i]] - x[[i]]) / abs(x[[i]]))
+      })
+      
+      BiasTest <- lapply(seq_along(BetaOutcome), function(i) {
+        list(
+          "Outcome" = i,
+          "Outliers Indices" = outliers,
+          "Distortion Coefficient" = 100 * BiasObs[[i]],
+          "Pvalue" = sapply(seq_along(BetaExposure), function(j) {
+            sum(abs(sapply(BiasExp[[i]], `[`, j)) > abs(BiasObs[[i]][j])) / NbDistribution
+          })
+        )
+      })
+      
+    } else {
+      BiasTest <- lapply(seq_along(BetaOutcome), function(i) {
+        list(
+          "Outcome" = i,
+          "Outliers Indices" = "All SNPs considered as outliers",
+          "Distortion Coefficient" = NA,
+          "Pvalue" = NA
+        )
+      })
+    }
+  } else {
+    BiasTest <- lapply(seq_along(BetaOutcome), function(i) {
+      list(
+        "Outcome" = i,
+        "Outliers Indices" = NULL,
+        "Distortion Coefficient" = NA,
+        "Pvalue" = NA
+      )
+    })
+  }
+  
+  # 5. Format and return results
+  coef_summary <- lapply(mod_all, summary)
+  
+  OriginalMR <- do.call(rbind, lapply(seq_along(BetaOutcome), function(i) {
+    outcome_coef <- coef(coef_summary[[i]])
+    data.frame(
+      Outcome = i,
+      Exposure = BetaExposure,
+      "MR Analysis" = "Raw",
+      "Causal Estimate" = outcome_coef[, "Estimate"],
+      "Sd" = outcome_coef[, "Std. Error"],
+      "T-stat" = outcome_coef[, "t value"],
+      "P-value" = outcome_coef[, "Pr(>|t|)"],
+      stringsAsFactors = FALSE
+    )
+  }))
+  
+  if(exists("mod_noOutliers")){
+    coef_summary_no_outliers <- lapply(mod_noOutliers, summary)
+    
+    OutlierCorrectedMR <- do.call(rbind, lapply(seq_along(BetaOutcome), function(i) {
+      outcome_coef <- coef(coef_summary_no_outliers[[i]])
+      data.frame(
+        Outcome = i,
+        Exposure = BetaExposure,
+        "MR Analysis" = "Outlier-corrected",
+        "Causal Estimate" = outcome_coef[, "Estimate"],
+        "Sd" = outcome_coef[, "Std. Error"],
+        "T-stat" = outcome_coef[, "t value"],
+        "P-value" = outcome_coef[, "Pr(>|t|)"],
+        stringsAsFactors = FALSE
+      )
+    }))
+  } else {
+    warning("No outliers were identified, therefore the results for the outlier-corrected MR are set to NA")
+    OutlierCorrectedMR <- do.call(rbind, lapply(seq_along(BetaOutcome), function(i) {
+      data.frame(
+        Outcome = i,
+        Exposure = BetaExposure,
+        "MR Analysis" = "Outlier-corrected",
+        "Causal Estimate" = NA,
+        "Sd" = NA,
+        "T-stat" = NA,
+        "P-value" = NA,
+        stringsAsFactors = FALSE
+      )
+    }))
+  }
+  
+  MR <- rbind.data.frame(OriginalMR, OutlierCorrectedMR)
+  row.names(MR) <- NULL
+  
+  final_results <- list(
+    "Main MR results" = MR,
+    "MR-PRESSO results" = list(
+      "Global Test" = GlobalTest,
+      "Outlier Test" = OutlierTest,
+      "Distortion Test" = BiasTest
+    )
+  )
+  
+  return(final_results)
+}
