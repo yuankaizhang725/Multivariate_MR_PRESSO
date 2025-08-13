@@ -1,0 +1,173 @@
+#' Generate diagnostic plots for multivariate MR-PRESSO results
+#' 
+#' @description
+#' Creates comprehensive visualization of MR-PRESSO results including outlier detection,
+#' effect comparisons, and residual diagnostics across multiple outcomes.
+#' 
+#' @param mr_results Output from mr_presso_multivariate function
+#' @param data Original data frame used in the analysis
+#' @param BetaOutcome Character vector of outcome beta column names
+#' @param BetaExposure Character vector of exposure beta column names
+#' @param plot_type Character, type of plot: "all", "outliers", "forest", "residuals", "mahalanobis"
+#' @param outcome_names Optional character vector of outcome names for labeling
+#' 
+#' @return A ggplot object or list of ggplot objects
+
+plot_mr_presso_multivariate <- function(mr_results, data, BetaOutcome, BetaExposure, 
+                                       plot_type = "all", outcome_names = NULL) {
+  
+  require(ggplot2)
+  require(gridExtra)
+  require(reshape2)
+  
+  # Extract components from results
+  outlier_test <- mr_results$`MR-PRESSO results`$`Outlier Test`
+  main_results <- mr_results$`Main MR results`
+  global_test <- mr_results$`MR-PRESSO results`$`Global Test`
+  
+  # Set outcome names
+  if(is.null(outcome_names)) {
+    outcome_names <- paste("Outcome", seq_along(BetaOutcome))
+  }
+  
+  # Helper function for outlier highlight plot
+  create_outlier_plot <- function() {
+    outlier_indices <- which(outlier_test$Pvalue <= 0.05)
+    
+    # Create data for plotting
+    plot_data <- data.frame(
+      SNP = 1:nrow(data),
+      RSS = outlier_test$RSSobs,
+      Pvalue = outlier_test$Pvalue,
+      Outlier = 1:nrow(data) %in% outlier_indices
+    )
+    
+    p1 <- ggplot(plot_data, aes(x = SNP, y = -log10(Pvalue), color = Outlier)) +
+      geom_point(size = 3, alpha = 0.7) +
+      geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+      scale_color_manual(values = c("FALSE" = "gray50", "TRUE" = "red")) +
+      labs(title = "MR-PRESSO Outlier Detection",
+           x = "SNP Index",
+           y = "-log10(P-value)",
+           subtitle = paste("Bonferroni-corrected threshold at p = 0.05")) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+    
+    return(p1)
+  }
+  
+  # Helper function for forest plot comparing effects
+  create_forest_plot <- function() {
+    # Prepare data for forest plot
+    forest_data <- main_results
+    forest_data$Outcome_Name <- rep(outcome_names, each = length(BetaExposure) * 2)
+    forest_data$Exposure_Index <- rep(rep(1:length(BetaExposure), 2), length(BetaOutcome))
+    
+    # Calculate confidence intervals
+    forest_data$CI_lower <- forest_data$Causal.Estimate - 1.96 * forest_data$Sd
+    forest_data$CI_upper <- forest_data$Causal.Estimate + 1.96 * forest_data$Sd
+    
+    p2 <- ggplot(forest_data, aes(x = Causal.Estimate, y = interaction(Exposure_Index, Outcome_Name),
+                                  color = MR.Analysis)) +
+      geom_point(position = position_dodge(width = 0.5), size = 3) +
+      geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper),
+                    position = position_dodge(width = 0.5), height = 0.2) +
+      geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+      scale_color_manual(values = c("Raw" = "blue", "Outlier-corrected" = "darkgreen")) +
+      labs(title = "Forest Plot: Raw vs Outlier-Corrected Estimates",
+           x = "Causal Estimate (95% CI)",
+           y = "Exposure-Outcome Combination") +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+    
+    return(p2)
+  }
+  
+  # Helper function for residual diagnostic plot
+  create_residual_plot <- function() {
+    # Calculate residuals for each outcome
+    residual_list <- list()
+    
+    for(i in seq_along(BetaOutcome)) {
+      X <- as.matrix(data[, BetaExposure])
+      Y <- as.vector(data[, BetaOutcome[i]])
+      weights <- 1 / data[, paste0("se.", BetaOutcome[i])]^2
+      
+      fit <- lm(Y ~ X - 1, weights = weights)
+      residuals_std <- rstandard(fit)
+      
+      residual_list[[i]] <- data.frame(
+        SNP = 1:length(residuals_std),
+        Residuals = residuals_std,
+        Outcome = outcome_names[i],
+        Outlier = 1:length(residuals_std) %in% global_test$outliers
+      )
+    }
+    
+    residual_data <- do.call(rbind, residual_list)
+    
+    p3 <- ggplot(residual_data, aes(x = SNP, y = Residuals, color = Outlier)) +
+      geom_point(alpha = 0.6) +
+      geom_hline(yintercept = c(-2, 0, 2), linetype = c("dashed", "solid", "dashed"),
+                alpha = c(0.5, 0.3, 0.5)) +
+      facet_wrap(~ Outcome, scales = "free_y") +
+      scale_color_manual(values = c("FALSE" = "gray50", "TRUE" = "red")) +
+      labs(title = "Standardized Residuals by Outcome",
+           x = "SNP Index",
+           y = "Standardized Residuals") +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+    
+    return(p3)
+  }
+  
+  # Helper function for Mahalanobis distance plot
+  create_mahalanobis_plot <- function() {
+    maha_data <- data.frame(
+      SNP = 1:nrow(outlier_test),
+      Mahalanobis = outlier_test$RSSobs,
+      Outlier = 1:nrow(outlier_test) %in% global_test$outliers
+    )
+    
+    # Add Q-Q plot reference line data
+    theoretical_quantiles <- qchisq(ppoints(nrow(maha_data)), df = length(BetaOutcome))
+    
+    p4 <- ggplot(maha_data, aes(x = theoretical_quantiles, y = sort(Mahalanobis))) +
+      geom_point(aes(color = Outlier[order(Mahalanobis)]), size = 2, alpha = 0.7) +
+      geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "blue") +
+      scale_color_manual(values = c("FALSE" = "gray50", "TRUE" = "red")) +
+      labs(title = "Q-Q Plot of Mahalanobis Distances",
+           x = "Theoretical Quantiles (Chi-squared)",
+           y = "Observed Mahalanobis Distances",
+           subtitle = paste("df =", length(BetaOutcome))) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+    
+    return(p4)
+  }
+  
+  # Generate plots based on type
+  if(plot_type == "outliers") {
+    return(create_outlier_plot())
+  } else if(plot_type == "forest") {
+    return(create_forest_plot())
+  } else if(plot_type == "residuals") {
+    return(create_residual_plot())
+  } else if(plot_type == "mahalanobis") {
+    return(create_mahalanobis_plot())
+  } else if(plot_type == "all") {
+    p1 <- create_outlier_plot()
+    p2 <- create_forest_plot()
+    p3 <- create_residual_plot()
+    p4 <- create_mahalanobis_plot()
+    
+    # Combine all plots
+    combined_plot <- grid.arrange(p1, p2, p3, p4, ncol = 2, 
+                                 top = "Multivariate MR-PRESSO Diagnostic Plots")
+    return(list(outlier_plot = p1, forest_plot = p2, 
+               residual_plot = p3, mahalanobis_plot = p4,
+               combined = combined_plot))
+  } else {
+    stop("Invalid plot_type. Choose from: 'all', 'outliers', 'forest', 'residuals', 'mahalanobis'")
+  }
+}
