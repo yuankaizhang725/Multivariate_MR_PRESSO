@@ -27,19 +27,6 @@
 #' 3. Distortion test to assess bias from outliers
 #' 4. Outlier-corrected MR analysis
 #' 
-#' @examples
-#' \dontrun{
-#' # Example usage with multiple outcomes
-#' results <- mr_presso_multivariate(
-#'   BetaOutcome = c("beta.outcome1", "beta.outcome2"),
-#'   BetaExposure = c("beta.exposure1", "beta.exposure2"),
-#'   SdOutcome = c("se.outcome1", "se.outcome2"),
-#'   SdExposure = c("se.exposure1", "se.exposure2"),
-#'   data = mr_data,
-#'   OUTLIERtest = TRUE,
-#'   DISTORTIONtest = TRUE
-#' )
-#' }
 
 mr_presso_multivariate <- function(BetaOutcome, BetaExposure, SdOutcome, SdExposure, data,
                                    OUTLIERtest = FALSE, DISTORTIONtest = FALSE, 
